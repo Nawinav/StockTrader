@@ -90,7 +90,7 @@ export function TokenStatusBanner() {
 
   // ── Handlers ─────────────────────────────────────────────────────────────
   const openModal = () => {
-    setState({ phase: "idle", sessionId: "", otp: "", message: "", expiresAt: "" });
+    setState({ phase: "idle", jobId: "", sessionId: "", otp: "", message: "", expiresAt: "" });
     setModalOpen(true);
   };
 

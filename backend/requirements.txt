@@ -1,0 +1,13 @@
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.4
+pydantic-settings==2.2.1
+python-dotenv==1.0.1
+httpx==0.27.0
+numpy>=1.26.4
+pyotp>=2.9.0
+playwright>=1.44.0
+
+# Optional: only needed when ANALYZER_PROVIDER=anthropic. The analyzer
+# works out-of-the-box with the stub client even if this is not installed.
+anthropic>=0.39.0

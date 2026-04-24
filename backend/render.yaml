@@ -1,0 +1,89 @@
+services:
+  - type: web
+    name: stock-suggestion-api
+    runtime: python
+    plan: free
+    rootDir: backend
+
+    # Free-first deploy path:
+    # keep the build light and avoid downloading Chromium unless you later
+    # enable Upstox headless auto-login.
+    # If you do enable that flow, change this to:
+    # pip install -r requirements.txt && playwright install chromium --with-deps
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    # Render checks this path every 30s. Must return HTTP 200.
+    healthCheckPath: /health
+
+    envVars:
+      # ---- App -------------------------------------------------------
+      - key: ENVIRONMENT
+        value: production
+
+      - key: SUGGESTIONS_TTL_SECONDS
+        value: "600"
+
+      # ---- Data provider ---------------------------------------------
+      # "mock" = synthetic data, no credentials needed.
+      # Change to "upstox" after setting the Upstox credentials below.
+      - key: DATA_PROVIDER
+        value: mock
+
+      - key: PAPER_TRADING
+        value: "true"
+
+      # ---- CORS ------------------------------------------------------
+      # The backend already allows https://*.vercel.app by regex.
+      # Only set this if you later move the frontend to a custom domain.
+      - key: CORS_ORIGINS
+        sync: false
+
+      # ---- Frontend URL (for push notification links) ----------------
+      - key: APP_FRONTEND_URL
+        sync: false
+
+      # ---- Persistence -----------------------------------------------
+      - key: WATCHLIST_PATH
+        value: watchlist.json
+
+      # ---- Upstox OAuth credentials ----------------------------------
+      # From https://upstox.com/developer/ -> My Apps
+      - key: UPSTOX_API_KEY
+        sync: false
+      - key: UPSTOX_API_SECRET
+        sync: false
+
+      # MUST match redirect URI registered on Upstox My Apps:
+      # https://your-service-name.onrender.com/auth/upstox/callback
+      - key: UPSTOX_REDIRECT_URI
+        sync: false
+
+      # Optional: paste a fresh token here to skip OAuth dance on first boot.
+      - key: UPSTOX_ACCESS_TOKEN
+        sync: false
+
+      # ---- Upstox headless auto-login --------------------------------
+      # Fill to enable daily auto-OTP refresh (see DEPLOYMENT.md)
+      - key: UPSTOX_MOBILE
+        sync: false
+      - key: UPSTOX_PIN
+        sync: false
+      - key: UPSTOX_TOTP_SECRET
+        sync: false
+
+      # ---- Push notifications (optional) -----------------------------
+      - key: NTFY_TOPIC
+        sync: false
+      - key: NTFY_SERVER
+        value: https://ntfy.sh
+
+      # ---- Claude AI analyzer (optional) -----------------------------
+      # Leave ANALYZER_PROVIDER=stub unless you want to pay for API calls
+      - key: ANALYZER_PROVIDER
+        value: stub
+      - key: ANTHROPIC_MODEL
+        value: claude-sonnet-4-6
+      - key: ANTHROPIC_API_KEY
+        sync: false

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+watchlist.json
+upstox_token.json
+upstox_instruments.json
+.pytest_cache/
+.mypy_cache/

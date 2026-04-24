@@ -9,25 +9,19 @@ from app.config import get_settings
 from app.data.universe import get_universe
 from app.models.schemas import Suggestion, SuggestionList
 from app.services.cache import cache
-from app.services.data_provider import get_provider
+from app.services.data_provider import MockProvider, get_provider
 from app.services.scoring import build_suggestion
 
 logger = logging.getLogger(__name__)
 
 
-def _rank_for(horizon: str, top_n: int = 10) -> List[Suggestion]:
-    settings = get_settings()
-    # Wrap provider construction so a bad Upstox token / proxy error doesn't
-    # take down the whole endpoint — fall back to mock automatically.
-    try:
-        provider = get_provider(settings.data_provider)
-    except Exception as exc:
-        logger.warning(
-            "get_provider(%s) failed — falling back to mock: %s",
-            settings.data_provider, exc,
-        )
-        provider = get_provider("mock")
-    suggestions: List[Suggestion] = []
+def _build_suggestions(provider, horizon: str) -> tuple[list[Suggestion], list[tuple[str, str]]]:
+    """Run scoring for every stock in the universe with the given provider.
+
+    Returns (suggestions, failures).  All per-symbol exceptions are caught
+    so one bad symbol never kills the whole response.
+    """
+    suggestions: list[Suggestion] = []
     failures: list[tuple[str, str]] = []
     for meta in get_universe():
         try:
@@ -36,48 +30,87 @@ def _rank_for(horizon: str, top_n: int = 10) -> List[Suggestion]:
                 failures.append((meta.symbol, "no candles returned"))
                 continue
             suggestions.append(build_suggestion(meta, candles, horizon))
-        except Exception as exc:
-            # One bad symbol (stale ISIN, delisted, rate-limited, etc.)
-            # must not take down the whole dashboard. Log and skip.
+        except Exception as exc:  # noqa: BLE001
             failures.append((meta.symbol, str(exc)[:200]))
             logger.warning("suggestion build failed for %s: %s", meta.symbol, exc)
-    if failures:
-        logger.info(
-            "suggestions (%s): %d ok, %d skipped. First failures: %s",
-            horizon, len(suggestions), len(failures), failures[:5],
+    return suggestions, failures
+
+
+def _rank_for(horizon: str, top_n: int = 10) -> tuple[list[Suggestion], str]:
+    """Return (top_n suggestions, provider_name_used).
+
+    Falls back to MockProvider automatically when:
+      * The configured provider can't be instantiated (bad proxy, missing dep), OR
+      * Every live-data call fails (expired token, rate-limit, network error).
+    """
+    settings = get_settings()
+    configured = settings.data_provider
+
+    # ── Step 1: try the configured provider ─────────────────────────────────
+    provider = None
+    try:
+        provider = get_provider(configured)
+    except Exception as exc:
+        logger.warning("get_provider(%s) init failed — falling back to mock: %s", configured, exc)
+
+    if provider is not None and configured != "mock":
+        suggestions, failures = _build_suggestions(provider, horizon)
+        if suggestions:
+            if failures:
+                logger.info(
+                    "suggestions (%s) via %s: %d ok, %d skipped. First failures: %s",
+                    horizon, configured, len(suggestions), len(failures), failures[:3],
+                )
+            _sort(suggestions, horizon)
+            return suggestions[:top_n], configured
+
+        # Every call failed — log and fall through to mock fallback.
+        logger.warning(
+            "suggestions (%s) via %s: ALL %d symbols failed — falling back to mock. "
+            "First failures: %s",
+            horizon, configured, len(failures), failures[:3],
         )
+
+    # ── Step 2: mock fallback (always works, deterministic synthetic data) ──
+    mock = MockProvider()
+    suggestions, failures = _build_suggestions(mock, horizon)
     if not suggestions:
-        # Surface a clear error instead of returning an empty list, so the
-        # frontend can show a real message.
         raise RuntimeError(
-            "No suggestions could be built — every provider call failed. "
+            "No suggestions could be built even with MockProvider. "
             f"Sample failures: {failures[:3]}"
         )
-    # For intraday we want the strongest directional signals (BUY or SELL),
-    # so rank by |composite - 50|. For long-term we care about absolute
-    # composite score (quality).
+    if failures:
+        logger.info(
+            "suggestions (%s) via mock fallback: %d ok, %d skipped.",
+            horizon, len(suggestions), len(failures),
+        )
+    _sort(suggestions, horizon)
+    return suggestions[:top_n], "mock (fallback)"
+
+
+def _sort(suggestions: list[Suggestion], horizon: str) -> None:
+    """Sort in-place: intraday by strongest signal, longterm by quality."""
     if horizon == "intraday":
         suggestions.sort(key=lambda s: abs(s.score.composite - 50), reverse=True)
     else:
         suggestions.sort(key=lambda s: s.score.composite, reverse=True)
-    return suggestions[:top_n]
 
 
 def get_suggestions(horizon: str, bust_cache: bool = False) -> SuggestionList:
     settings = get_settings()
     cache_key = f"suggestions::{horizon}"
     if bust_cache:
-        # Also drop cached provider candles so the rebuild truly uses fresh data.
+        # Also drop cached provider candles so the rebuild uses fresh data.
         for k in list(getattr(cache, "_store", {}).keys()):
             if k.startswith("upstox:history:") or k.startswith("upstox:ltp:"):
                 cache._store.pop(k, None)
     else:
         hit = cache.get(cache_key)
         if hit:
-            payload, expires_at = hit
+            payload, _expires_at = hit
             return payload
 
-    items = _rank_for(horizon)
+    items, provider_used = _rank_for(horizon)
     now = datetime.now(timezone.utc)
     expires_at = cache.set(cache_key, None, settings.suggestions_ttl_seconds)
     next_refresh = datetime.fromtimestamp(expires_at, tz=timezone.utc)
@@ -87,7 +120,7 @@ def get_suggestions(horizon: str, bust_cache: bool = False) -> SuggestionList:
         next_refresh_at=next_refresh.isoformat(),
         ttl_seconds=settings.suggestions_ttl_seconds,
         items=items,
-        data_provider=settings.data_provider,
+        data_provider=provider_used,
     )
     cache.set(cache_key, payload, settings.suggestions_ttl_seconds)
     return payload

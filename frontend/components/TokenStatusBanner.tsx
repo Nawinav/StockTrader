@@ -20,14 +20,15 @@ import { api } from "@/lib/api";
 
 type Phase =
   | "idle"              // modal closed / not started
-  | "starting"          // waiting for /start-login response
-  | "otp_input"         // backend paused — user must enter OTP
+  | "starting"          // background job launched, polling for result
+  | "otp_input"         // browser finished; user must enter SMS OTP
   | "submitting"        // waiting for /submit-otp response
   | "success"           // login complete
   | "error";            // something went wrong
 
 interface ModalState {
   phase: Phase;
+  jobId: string;       // background login job ID
   sessionId: string;
   otp: string;
   message: string;
@@ -44,6 +45,7 @@ export function TokenStatusBanner() {
 
   const [state, setState] = useState<ModalState>({
     phase: "idle",
+    jobId: "",
     sessionId: "",
     otp: "",
     message: "",
@@ -51,6 +53,7 @@ export function TokenStatusBanner() {
   });
 
   const otpInputRef = useRef<HTMLInputElement>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ── Poll token status ────────────────────────────────────────────────────
   const checkStatus = useCallback(async () => {
@@ -92,30 +95,70 @@ export function TokenStatusBanner() {
   };
 
   const closeModal = () => {
+    stopPoll();
     setModalOpen(false);
-    setState((s) => ({ ...s, phase: "idle", otp: "" }));
+    setState((s) => ({ ...s, phase: "idle", otp: "", jobId: "" }));
+  };
+
+  // Stop any running poll timer
+  const stopPoll = () => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  };
+
+  // Poll /login-job/{jobId} every 3 s until we get a terminal status
+  const startPolling = (jobId: string) => {
+    stopPoll();
+    pollTimerRef.current = setInterval(async () => {
+      try {
+        const job = await api.upstoxLoginJobStatus(jobId);
+        if (job.status === "otp_required" && job.session_id) {
+          stopPoll();
+          setState((s) => ({
+            ...s,
+            phase: "otp_input",
+            sessionId: job.session_id!,
+            message:
+              "An OTP has been sent to your registered mobile number. " +
+              "Enter it below to complete login.",
+          }));
+        } else if (job.status === "success") {
+          stopPoll();
+          setState((s) => ({
+            ...s,
+            phase: "success",
+            expiresAt: job.token_expires_at || "",
+          }));
+          setTokenExpired(false);
+        } else if (job.status === "error") {
+          stopPoll();
+          setState((s) => ({
+            ...s,
+            phase: "error",
+            message: `Login failed: ${job.error || "Unknown error"}`,
+          }));
+        }
+        // status === "starting" → keep polling
+      } catch (err: unknown) {
+        stopPoll();
+        const msg = err instanceof Error ? err.message : String(err);
+        setState((s) => ({ ...s, phase: "error", message: `Poll error: ${msg}` }));
+      }
+    }, 3000);
   };
 
   const startLogin = async () => {
-    setState((s) => ({ ...s, phase: "starting", message: "" }));
+    setState((s) => ({ ...s, phase: "starting", message: "", jobId: "" }));
     try {
       const res = await api.upstoxStartLogin();
-      if (res.status === "otp_required" && res.session_id) {
-        setState((s) => ({
-          ...s,
-          phase: "otp_input",
-          sessionId: res.session_id!,
-          message:
-            "An OTP has been sent to your registered mobile number. " +
-            "Enter it below to complete login.",
-        }));
-      } else if (res.status === "success") {
-        setState((s) => ({
-          ...s,
-          phase: "success",
-          expiresAt: res.token_expires_at || "",
-        }));
-        setTokenExpired(false);
+      if (res.job_id) {
+        setState((s) => ({ ...s, jobId: res.job_id! }));
+        startPolling(res.job_id);
+      } else {
+        // Shouldn't happen but handle gracefully
+        setState((s) => ({ ...s, phase: "error", message: "No job ID returned from server" }));
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -253,11 +296,11 @@ export function TokenStatusBanner() {
                 <div className="flex flex-col items-center gap-3 py-4">
                   <Spinner />
                   <p className="text-sm text-slate-500">
-                    Launching browser and requesting OTP from Upstox…
+                    Launching browser and navigating to Upstox…
                   </p>
                   <p className="text-xs text-slate-400 text-center">
-                    This usually takes 15–30 seconds. An SMS will be sent to
-                    your registered mobile number.
+                    This takes 30–60 seconds on first run. Checking every 3 s.
+                    An SMS OTP will be sent to your registered mobile.
                   </p>
                 </div>
               )}

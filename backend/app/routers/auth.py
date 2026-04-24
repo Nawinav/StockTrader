@@ -12,6 +12,9 @@ needs to run at least once per trading day. Usage:
 """
 from __future__ import annotations
 
+import threading
+import uuid
+from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
 import httpx
@@ -27,6 +30,13 @@ router = APIRouter(prefix="/auth/upstox", tags=["auth"])
 
 UPSTOX_AUTHORIZE_URL = "https://api.upstox.com/v2/login/authorization/dialog"
 UPSTOX_TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"
+
+# ── In-memory login job store ─────────────────────────────────────────────────
+# Keyed by job_id (hex uuid).  Each entry:
+#   {"status": "starting"|"otp_required"|"success"|"error",
+#    "session_id": str|None, "token_expires_at": str|None, "error": str|None}
+_jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
 
 
 def _require_oauth_config() -> tuple[str, str, str]:
@@ -174,26 +184,79 @@ class OtpSubmit(BaseModel):
     otp: str
 
 
-@router.post("/start-login")
-def start_login() -> dict:
-    """Launch a headless browser login session in stdin-OTP mode.
-
-    The subprocess navigates to Upstox, fills in the mobile number and clicks
-    "Get OTP".  When the SMS OTP field appears the process pauses and returns
-    ``{"status": "otp_required", "session_id": "..."}`` so the frontend can
-    show an OTP entry dialog.
-
-    If SMS OTP is not required (rare) it completes immediately and returns
-    ``{"status": "success"}``.
-    """
+def _run_start_login(job_id: str) -> None:
+    """Background thread: calls start_login_session() and updates _jobs."""
     from app.integrations.upstox import UpstoxAuthError, start_login_session, token_expiry_ist
     try:
-        status, session_id = start_login_session()
+        login_status, session_id = start_login_session()
+        with _jobs_lock:
+            if login_status == "otp_required":
+                _jobs[job_id] = {
+                    "status": "otp_required",
+                    "session_id": session_id,
+                    "token_expires_at": None,
+                    "error": None,
+                }
+            else:
+                _jobs[job_id] = {
+                    "status": "success",
+                    "session_id": None,
+                    "token_expires_at": token_expiry_ist(),
+                    "error": None,
+                }
     except UpstoxAuthError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    if status == "otp_required":
-        return {"status": "otp_required", "session_id": session_id}
-    return {"status": "success", "token_expires_at": token_expiry_ist()}
+        with _jobs_lock:
+            _jobs[job_id] = {
+                "status": "error",
+                "session_id": None,
+                "token_expires_at": None,
+                "error": str(exc),
+            }
+    except Exception as exc:  # noqa: BLE001
+        with _jobs_lock:
+            _jobs[job_id] = {
+                "status": "error",
+                "session_id": None,
+                "token_expires_at": None,
+                "error": f"Unexpected error: {exc}",
+            }
+
+
+@router.post("/start-login")
+def start_login() -> dict:
+    """Launch a headless browser login session in the background.
+
+    Returns immediately with ``{"status": "starting", "job_id": "..."}``
+    so the client doesn't time out waiting for Chromium to launch.
+
+    Poll ``GET /auth/upstox/login-job/{job_id}`` every few seconds until
+    the status changes to ``otp_required`` (enter the SMS OTP) or ``success``.
+    """
+    job_id = uuid.uuid4().hex
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "starting", "session_id": None, "token_expires_at": None, "error": None}
+
+    t = threading.Thread(target=_run_start_login, args=(job_id,), daemon=True)
+    t.start()
+
+    return {"status": "starting", "job_id": job_id}
+
+
+@router.get("/login-job/{job_id}")
+def login_job_status(job_id: str) -> dict:
+    """Poll the status of a background login job started by /start-login.
+
+    Returns:
+      {"status": "starting"}                        — browser still launching
+      {"status": "otp_required", "session_id": ...} — waiting for SMS OTP
+      {"status": "success", "token_expires_at": ...} — login complete
+      {"status": "error", "error": "..."}            — something went wrong
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Login job '{job_id}' not found")
+    return job
 
 
 @router.post("/submit-otp")

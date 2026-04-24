@@ -514,12 +514,28 @@ export const api = {
       error: string | null;
     }>(`/auth/upstox/test`),
 
-  /** Start a headless login session. Returns otp_required + session_id or success. */
+  /**
+   * Start a headless login session in the background.
+   * Returns immediately with { status: "starting", job_id }.
+   * Poll upstoxLoginJobStatus() until status changes.
+   */
   upstoxStartLogin: () =>
-    request<{ status: string; session_id?: string; token_expires_at?: string }>(
+    request<{ status: string; job_id?: string }>(
       `/auth/upstox/start-login`,
       { method: "POST" },
     ),
+
+  /**
+   * Poll the background login job status.
+   * Possible statuses: "starting" | "otp_required" | "success" | "error"
+   */
+  upstoxLoginJobStatus: (jobId: string) =>
+    request<{
+      status: string;
+      session_id?: string;
+      token_expires_at?: string;
+      error?: string;
+    }>(`/auth/upstox/login-job/${jobId}`),
 
   /** Submit the SMS OTP to the waiting login session. */
   upstoxSubmitOtp: (session_id: string, otp: string) =>

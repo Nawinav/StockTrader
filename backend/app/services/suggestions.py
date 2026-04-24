@@ -17,7 +17,16 @@ logger = logging.getLogger(__name__)
 
 def _rank_for(horizon: str, top_n: int = 10) -> List[Suggestion]:
     settings = get_settings()
-    provider = get_provider(settings.data_provider)
+    # Wrap provider construction so a bad Upstox token / proxy error doesn't
+    # take down the whole endpoint — fall back to mock automatically.
+    try:
+        provider = get_provider(settings.data_provider)
+    except Exception as exc:
+        logger.warning(
+            "get_provider(%s) failed — falling back to mock: %s",
+            settings.data_provider, exc,
+        )
+        provider = get_provider("mock")
     suggestions: List[Suggestion] = []
     failures: list[tuple[str, str]] = []
     for meta in get_universe():

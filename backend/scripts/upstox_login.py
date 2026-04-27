@@ -145,7 +145,16 @@ def main() -> None:
     print("upstox_login: starting headless Chromium", flush=True)
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+            ],
+        )
         page    = browser.new_context().new_page()
 
         # Intercept any request to the callback URL to capture the auth code.

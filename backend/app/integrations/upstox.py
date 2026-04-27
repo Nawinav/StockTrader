@@ -195,22 +195,11 @@ def auto_login() -> str:
             f"Cannot auto-login — missing in .env: {', '.join(missing)}"
         )
 
-    # Resolve the login script relative to this file's package root.
-    # upstox.py is at  backend/app/integrations/upstox.py
-    # login script is  backend/scripts/upstox_login.py
-    script_path = (
-        Path(__file__).resolve().parent.parent.parent / "scripts" / "upstox_login.py"
-    )
-    if not script_path.exists():
-        raise UpstoxAuthError(
-            f"Login script not found at {script_path}. "
-            "Make sure scripts/upstox_login.py exists in the backend folder."
-        )
+    scripts_dir = Path(__file__).resolve().parent.parent.parent / "scripts"
+    token_file  = str(TOKEN_FILE.resolve())
 
-    token_file = str(TOKEN_FILE.resolve())
-
-    cmd = [
-        sys.executable, str(script_path),
+    # Common CLI args shared by both login scripts.
+    common_args = [
         "--api-key",      s.upstox_api_key,
         "--api-secret",   s.upstox_api_secret,
         "--redirect-uri", s.upstox_redirect_uri,
@@ -220,38 +209,77 @@ def auto_login() -> str:
         "--token-file",   token_file,
     ]
 
-    logger.info("Upstox auto-login: spawning login subprocess")
+    def _run_script(script_path: Path, label: str) -> "subprocess.CompletedProcess[str]":
+        if not script_path.exists():
+            raise UpstoxAuthError(f"Login script not found: {script_path}")
+        logger.info("Upstox auto-login: trying %s", label)
+        try:
+            return subprocess.run(
+                [sys.executable, str(script_path)] + common_args,
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            raise UpstoxAuthError(f"{label} timed out (30 s).")
+        except Exception as exc:
+            raise UpstoxAuthError(f"Failed to launch {label}: {exc}") from exc
+
+    def _log_and_check(result: "subprocess.CompletedProcess[str]", label: str) -> bool:
+        for line in result.stdout.splitlines():
+            logger.info("[%s] %s", label, line)
+        for line in result.stderr.splitlines():
+            logger.warning("[%s] %s", label, line)
+        return result.returncode == 0
+
+    # ── Try 1: fast direct-HTTP login (no browser, ~3-5 s) ─────────────────
+    http_script = scripts_dir / "upstox_http_login.py"
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,          # 2-minute hard cap
-        )
-    except subprocess.TimeoutExpired:
-        raise UpstoxAuthError("Upstox auto-login subprocess timed out (120 s).")
-    except Exception as exc:  # noqa: BLE001
-        raise UpstoxAuthError(f"Failed to launch login subprocess: {exc}") from exc
+        result = _run_script(http_script, "http-login")
+        if _log_and_check(result, "http-login"):
+            fresh = load_stored_token()
+            if fresh:
+                logger.info("Upstox auto-login (HTTP): SUCCESS")
+                return fresh
+            logger.warning("HTTP login succeeded but token file empty — trying Playwright fallback")
+        else:
+            detail = result.stderr.strip() or result.stdout.strip()
+            logger.warning("HTTP login failed (%s) — falling back to Playwright", detail[:200])
+    except UpstoxAuthError as exc:
+        logger.warning("HTTP login error (%s) — falling back to Playwright", exc)
 
-    # Forward subprocess output to our logger so it appears in uvicorn logs.
-    for line in result.stdout.splitlines():
-        logger.info("[login] %s", line)
-    for line in result.stderr.splitlines():
-        logger.warning("[login] %s", line)
+    # ── Try 2: Playwright headless browser fallback (slower, ~60-90 s) ─────
+    pw_script = scripts_dir / "upstox_login.py"
+    try:
+        result = _run_script.__wrapped__ if hasattr(_run_script, "__wrapped__") else None
+        # Re-run with longer timeout for Playwright
+        if not pw_script.exists():
+            raise UpstoxAuthError(f"Playwright login script not found: {pw_script}")
+        logger.info("Upstox auto-login: trying playwright-login")
+        try:
+            result = subprocess.run(
+                [sys.executable, str(pw_script)] + common_args,
+                capture_output=True, text=True, timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            raise UpstoxAuthError("Playwright login timed out (120 s).")
+        except Exception as exc:
+            raise UpstoxAuthError(f"Failed to launch playwright-login: {exc}") from exc
 
-    if result.returncode != 0:
-        # stderr contains the ERROR: ... message from the script.
-        detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
-        raise UpstoxAuthError(f"Upstox auto-login failed: {detail}")
+        for line in result.stdout.splitlines():
+            logger.info("[playwright-login] %s", line)
+        for line in result.stderr.splitlines():
+            logger.warning("[playwright-login] %s", line)
 
-    # Read the fresh token that the subprocess just wrote.
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise UpstoxAuthError(f"Playwright login failed: {detail}")
+    except UpstoxAuthError:
+        raise
+
     fresh = load_stored_token()
     if not fresh:
-        raise UpstoxAuthError(
-            "Login subprocess succeeded but token file is empty."
-        )
+        raise UpstoxAuthError("Login subprocess succeeded but token file is empty.")
 
-    logger.info("Upstox auto-login: SUCCESS — token valid until ~03:30 IST tomorrow")
+    logger.info("Upstox auto-login (Playwright): SUCCESS — token valid until ~03:30 IST tomorrow")
     return fresh
 
 
